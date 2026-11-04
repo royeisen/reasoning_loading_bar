@@ -7,7 +7,7 @@ import numpy as np
 from transformers import AutoModelForCausalLM, AutoTokenizer
 import argparse
 import logging
-from utils import load_problems
+from utils import load_problems, resolve_hidden_layer, resolve_intervention_module
 
 # Setup logging
 logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
@@ -18,7 +18,8 @@ def generate_with_intervention(
     prompt,
     max_new_tokens=1,
     intervention_vector=None,
-    intervention_scale=1.0
+    intervention_scale=1.0,
+    target_module=None
 ):
     """Generates tokens with intervention by hooking into the generation process."""
     inputs = tokenizer(prompt, return_tensors="pt").to(model.device)
@@ -58,12 +59,13 @@ def generate_with_intervention(
         else:
             return modified_states
     
-    # Always use model.model.norm as the intervention target
-    target_intervention_module = model.model.norm
+    # Intervene where the TPV was trained. Defaults to model.model.norm (final
+    # layer) only when no module is supplied, preserving the original behaviour.
+    target_intervention_module = target_module if target_module is not None else model.model.norm
     
     if intervention_vector is not None:
         if not hasattr(target_intervention_module, 'register_forward_hook'):
-            raise ValueError(f"The module model.model.norm does not have 'register_forward_hook' method.")
+            raise ValueError(f"Target module {type(target_intervention_module)} has no 'register_forward_hook'.")
         hook_handles.append(target_intervention_module.register_forward_hook(forward_hook))
         logging.debug(f"Intervention hook registered on model.model.norm ({type(target_intervention_module)}).")
         logging.debug(f"Intervention vector shape: {intervention_vector.shape}")
@@ -113,6 +115,14 @@ def main():
                         help="Maximum number of new tokens to generate.")
     parser.add_argument("--device", type=str, default="auto",
                         help="Device to use ('cuda', 'cpu', or 'auto' to use model's device_map preference).")
+    parser.add_argument("--hidden_layer", type=int, default=-1,
+                        help="Hidden-states index the TPV was trained on. DEFAULT -1 (final "
+                             "layer) and you almost certainly want to keep it. A final-layer "
+                             "intervention edits only the current step logits; an intermediate "
+                             "layer feeds attention in every later layer, so the edit is written "
+                             "into the KV cache and leaks into all subsequent decoding steps "
+                             "(paper Sec. 3.1/3.2). Intermediate layers are better for "
+                             "MONITORING only.")
     parser.add_argument("--torch_dtype", type=str, default="float16", choices=["float16", "bfloat16", "float32"],
                         help="Torch dtype for model loading (float16, bfloat16, float32).")
 
@@ -138,6 +148,16 @@ def main():
     
     # Determine the device the model ended up on
     effective_device = model.device 
+    layer_idx = resolve_hidden_layer(model, args.hidden_layer)
+    target_module = resolve_intervention_module(model, layer_idx)
+    logging.info(f"Intervening on hidden_states[{layer_idx}] -> {type(target_module).__name__}")
+    if layer_idx != model.config.num_hidden_layers:
+        logging.warning(
+            "Intervening at intermediate layer %d of %d. That output is consumed by the "
+            "attention of every later layer, so the edit is written into the KV cache and "
+            "persists across decoding steps; it does NOT isolate to a single step the way a "
+            "final-layer intervention does. Use --hidden_layer -1 to reproduce the paper.",
+            layer_idx, model.config.num_hidden_layers)
     logging.info(f"Model loaded. Effective device for intervention vector: {effective_device}")
 
     logging.info("Preparing intervention vector...")
@@ -186,7 +206,8 @@ def main():
             model, tokenizer, prompt, 
             max_new_tokens=args.max_new_tokens, 
             intervention_vector=intervention_vector,
-            intervention_scale=intervention_scale
+            intervention_scale=intervention_scale,
+            target_module=target_module
         )
         
         output_file_path = os.path.join(problem_output_dir, f"response_alpha_{args.alpha}.txt")
