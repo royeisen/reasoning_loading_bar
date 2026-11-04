@@ -120,6 +120,75 @@ python train_tpv.py --input_dir "llama_math_tpv_dataset" --output_dir "tpv_model
 python tpv_intervention.py --model_name_or_path "deepseek-ai/DeepSeek-R1-Distill-Llama-8B" --intervention_vector_path "tpv_model/tpv_linear_weights.npy" --alpha 100.0
 ```
 
+## Probe Layer Selection
+
+By default the TPV is now read from an **intermediate** layer (45% of depth) rather than
+the final layer. Layer sweeps on held-out MATH-500 problems (4096-token budget, 120
+problems, 5 generations each, 80/20 split by problem):
+
+| probe layer | DeepSeek-R1-Distill-Llama-8B (32L) | Qwen3-1.7B (28L) |
+|---|---|---|
+| ~25% depth | R^2 0.766 (L8) | R^2 0.757 (L7) |
+| ~45% depth | R^2 0.766 (L14) | **R^2 0.805** (L12) |
+| final layer | R^2 0.602 (L32) | R^2 0.638 (L28) |
+
+End-to-end through this pipeline at the 45% default:
+
+| model | layer | test MSE | test R^2 |
+|---|---|---|---|
+| DeepSeek-R1-Distill-Llama-8B | 14 / 32 | 0.0195 | 0.766 |
+| Qwen3-1.7B | 13 / 28 | 0.0153 | 0.816 |
+| DeepSeek-R1-Distill-Llama-8B | 32 (previous default) | 0.0331 | 0.602 |
+
+Use `--hidden_layer` to override; `-1` reproduces the original final-layer behaviour.
+
+### Monitoring vs. intervention use different layers
+
+This matters and is easy to get wrong. The final layer is the **correct** intervention
+site, exactly as described in the paper (Sec. 3.1, 3.2): it sits downstream of all
+attention, so an edit there changes only the current step's logits and is never written
+into the KV cache. Editing an intermediate layer feeds attention in every later layer,
+so the perturbation is cached and leaks into all subsequent decoding steps.
+
+- **Monitoring only** -> use the intermediate-layer default (better accuracy).
+- **Intervention** -> train the TPV with `--hidden_layer -1` and run
+  `tpv_intervention.py` with its default `-1`. Weights trained at an intermediate layer
+  are not valid inputs to the intervention pipeline.
+
+## Chat Models (Qwen3, etc.)
+
+The default prompt template appends a bare `<think>\n` and relies on the model
+continuing from it. That works for the DeepSeek-R1 distills but **silently produces a
+degenerate dataset for chat models**: without the `<|im_start|>assistant` scaffolding,
+Qwen3-1.7B emits `</think>` as its first generated token, so every trajectory has
+thinking length N=1. This passes the `</think>` filter and reports a 100% success rate
+while containing no usable signal.
+
+Pass `--use_chat_template` for such models to format via the tokenizer's chat template
+with thinking enabled (Qwen3-1.7B: mean N goes from 1 to 2076).
+
+```bash
+python generate_tpv_data.py --model "Qwen/Qwen3-1.7B" --use_chat_template \
+  --max_new_tokens 4096 --dataset math500 --output_dir qwen3_hidden_states
+```
+
+## Evaluation Utilities
+
+```bash
+python eval_r2.py --input_dir <dataset_dir>            # R^2; fp32/fp64 + intercept checks
+python eval_r2_per_gen.py --input_dir <hidden_states>  # within-generation R^2
+python layer_sweep.py --run_dir <hidden_states> --model <name>   # R^2 vs depth
+```
+
+`train_tpv.py` reports MSE only. Note it refits on train+test before saving weights, so
+the saved model is not the one whose held-out MSE is printed.
+
+A note on generation budget: `max_new_tokens` controls how many trajectories reach
+`</think>`, and `prepare_tpv_dataset.py` silently discards those that do not. At 1024
+tokens only 18.7% of Llama-8B generations survive (biasing the dataset toward short
+reasoning); at 4096 tokens 72.3% survive. Check the surviving fraction before trusting
+a result.
+
 ## Notes
 - Ensure that the model names and data paths are correctly set according to your environment.
 - The alpha parameter controls the strength of the intervention - higher values result in stronger interventions.
