@@ -419,7 +419,7 @@ if __name__ == "__main__":
     parser.add_argument("--hidden_layer", type=int, default=None,
                         help="Index into outputs.hidden_states to use as the TPV feature. "
                              "Negative counts from the end (-1 = final layer, the old behaviour). "
-                             "Default: 25%% of depth, which measures substantially better than "
+                             "Default: 45%% of depth, which measures substantially better than "
                              "the final layer (see resolve_hidden_layer in utils.py).")
     parser.add_argument("--use_chat_template", action="store_true", default=False,
                         help="Format the problem with the tokenizer chat template and thinking "

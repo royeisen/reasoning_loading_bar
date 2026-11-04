@@ -53,20 +53,30 @@ def resolve_hidden_layer(model, hidden_layer=None):
     output and index ``i`` is the output of decoder layer ``i - 1``, so index ``n``
     (equivalently ``-1``) is the final layer.
 
-    Earlier versions of this code hardcoded the final layer. A layer sweep on
-    DeepSeek-R1-Distill-Llama-8B (MATH-500, 434 generations, held-out problems) shows
-    the final layer is in fact the weakest useful probe target, because it is
-    specialised for next-token prediction rather than carrying trajectory state:
+    Earlier versions of this code hardcoded the final layer. Layer sweeps on held-out
+    MATH-500 problems show the final layer is in fact the weakest useful probe target,
+    because it is specialised for next-token prediction rather than carrying
+    trajectory state.
 
-        layer  2  test R^2 = 0.673
-        layer  6  test R^2 = 0.733
-        layer  8  test R^2 = 0.766   <- best
-        layer 14  test R^2 = 0.766
-        layer 20  test R^2 = 0.726
-        layer 32  test R^2 = 0.602   <- final layer (previous default)
+    DeepSeek-R1-Distill-Llama-8B (32 layers, 434 generations):
 
-    The optimum is a broad plateau roughly 25-50% of the way up the stack, so when
-    ``hidden_layer`` is not given we default to 25% of depth.
+        layer  2  R^2 0.673    layer 14  R^2 0.766  (44% depth)
+        layer  6  R^2 0.733    layer 20  R^2 0.726
+        layer  8  R^2 0.766    layer 32  R^2 0.602  <- final (previous default)
+                  (25% depth)
+
+    Qwen3-1.7B (28 layers, 418 generations):
+
+        layer  4  R^2 0.758    layer 12  R^2 0.805  (43% depth) <- best
+        layer  7  R^2 0.757    layer 14  R^2 0.804
+                  (25% depth)  layer 18  R^2 0.789
+        layer 10  R^2 0.773    layer 28  R^2 0.638  <- final
+
+    Note the optimum is NOT a fixed 25% of depth: Llama-8B is flat between 25% and
+    44%, but Qwen3-1.7B is clearly better at ~43% (0.805) than at 25% (0.757). We
+    therefore default to 45% of depth, which is at or near the optimum for both.
+    The plateau is broad, so the exact fraction is not critical -- but the final
+    layer and the very early layers are both measurably bad.
 
     Args:
         model: a loaded HF model (uses ``model.config.num_hidden_layers``).
@@ -78,7 +88,7 @@ def resolve_hidden_layer(model, hidden_layer=None):
     """
     n = model.config.num_hidden_layers
     if hidden_layer is None:
-        return max(1, round(0.25 * n))
+        return max(1, round(0.45 * n))
     if hidden_layer < 0:
         resolved = n + 1 + hidden_layer
     else:
