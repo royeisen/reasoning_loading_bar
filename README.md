@@ -28,10 +28,20 @@ The monitoring pipeline consists of three sequential scripts that should be run 
 
 This script generates responses from a language model and extracts hidden states for TPV training.
 
+> **Two things to get right before running this** (details in
+> [Probe Layer Selection](#probe-layer-selection) and [Chat Models](#chat-models-qwen3-etc)):
+> - **Token budget.** Generations that never reach `</think>` are silently dropped in Step 2.
+>   At `--max_new_tokens 1024` only 18.7% of DeepSeek-R1-Distill-Llama-8B generations survive;
+>   at 4096, 72.3% do. Check the surviving fraction before trusting any result.
+> - **Chat models** (Qwen3 etc.) need `--use_chat_template`, or they emit `</think>`
+>   immediately and produce a dataset with zero usable signal and no error.
+>
+> If you plan to run the **intervention** pipeline afterwards, add `--hidden_layer -1`.
+
 ```bash
 python generate_tpv_data.py \
   --model "deepseek-ai/DeepSeek-R1-Distill-Qwen-32B" \
-  --max_new_tokens 1024 \
+  --max_new_tokens 4096 \
   --dataset "math500" \
   --start_problem_index 0 \
   --end_problem_index 30 \
@@ -60,6 +70,11 @@ python prepare_tpv_dataset.py \
 
 This will process the hidden states from the previous step and create train/test datasets in the `qwen_math_tpv_dataset` directory.
 
+> **Note:** generations whose output never contains `end_of_thinking_token` are skipped
+> without warning, as are problems left with no valid generations. The printed record
+> counts are therefore the *surviving* data, not what you generated. A large drop here
+> means your token budget was too small (see Step 1).
+
 ### Step 3: Train TPV Regressor
 
 This script trains a linear regression model on the prepared datasets to predict token progress values.
@@ -73,6 +88,10 @@ python train_tpv.py \
 ```
 
 This will train a TPV regressor using linear regression, evaluate its performance, and save the model weights to the `qwen_math_tpv_model` directory.
+
+> **Note:** this reports **MSE only**, and the weights it saves are refit on train+test,
+> so the saved model is not the one whose held-out MSE is printed. For R^2 on held-out
+> problems use `eval_r2.py` (see [Evaluation Utilities](#evaluation-utilities)).
 
 ## Part 2: TPV Intervention System
 
@@ -107,18 +126,100 @@ This will apply the trained intervention vector to the model's generation proces
 Here's an example of running the complete pipeline with consistent input/output directories:
 
 ```bash
-# Step 1: Generate hidden states data
-python generate_tpv_data.py --model "deepseek-ai/DeepSeek-R1-Distill-Llama-8B" --output_dir "llama_hidden_states"
+# Step 1: Generate hidden states data.
+# --max_new_tokens is REQUIRED here: it defaults to 8, which produces no usable data.
+# --hidden_layer -1 because this example ends in an intervention (Step 4), which is only
+# valid for a final-layer TPV. Drop it for a monitoring-only run to get the better default.
+python generate_tpv_data.py --model "deepseek-ai/DeepSeek-R1-Distill-Llama-8B" \
+  --max_new_tokens 4096 --end_problem_index 120 --hidden_layer -1 \
+  --output_dir "llama_hidden_states"
 
 # Step 2: Prepare the TPV dataset
 python prepare_tpv_dataset.py --input_dir "llama_hidden_states" --output_dir "llama_math_tpv_dataset"
 
-# Step 3: Train the TPV regressor
+# Step 3: Train the TPV regressor (prints MSE; use eval_r2.py for R^2)
 python train_tpv.py --input_dir "llama_math_tpv_dataset" --output_dir "tpv_model"
+python eval_r2.py --input_dir "llama_math_tpv_dataset" --run_dir "llama_hidden_states" --per_generation
 
 # Step 4: Use the trained TPV regressor for intervention
 python tpv_intervention.py --model_name_or_path "deepseek-ai/DeepSeek-R1-Distill-Llama-8B" --intervention_vector_path "tpv_model/tpv_linear_weights.npy" --alpha 100.0
 ```
+
+## Probe Layer Selection
+
+By default the TPV is now read from an **intermediate** layer (45% of depth) rather than
+the final layer. Layer sweeps on held-out MATH-500 problems (4096-token budget, 120
+problems, 5 generations each, 80/20 split by problem):
+
+| probe layer | DeepSeek-R1-Distill-Llama-8B (32L) | Qwen3-1.7B (28L) |
+|---|---|---|
+| ~25% depth | R^2 0.766 (L8) | R^2 0.757 (L7) |
+| ~45% depth | R^2 0.766 (L14) | **R^2 0.805** (L12) |
+| final layer | R^2 0.602 (L32) | R^2 0.638 (L28) |
+
+End-to-end through this pipeline at the 45% default:
+
+| model | layer | test MSE | test R^2 |
+|---|---|---|---|
+| DeepSeek-R1-Distill-Llama-8B | 14 / 32 | 0.0195 | 0.766 |
+| Qwen3-1.7B | 13 / 28 | 0.0153 | 0.816 |
+| DeepSeek-R1-Distill-Llama-8B | 32 (previous default) | 0.0331 | 0.602 |
+
+Use `--hidden_layer` to override; `-1` reproduces the original final-layer behaviour.
+
+### Monitoring vs. intervention use different layers
+
+This matters and is easy to get wrong. The final layer is the **correct** intervention
+site, exactly as described in the paper (Sec. 3.1, 3.2): it sits downstream of all
+attention, so an edit there changes only the current step's logits and is never written
+into the KV cache. Editing an intermediate layer feeds attention in every later layer,
+so the perturbation is cached and leaks into all subsequent decoding steps.
+
+- **Monitoring only** -> use the intermediate-layer default (better accuracy).
+- **Intervention** -> train the TPV with `--hidden_layer -1` and run
+  `tpv_intervention.py` with its default `-1`. Weights trained at an intermediate layer
+  are not valid inputs to the intervention pipeline.
+
+## Chat Models (Qwen3, etc.)
+
+The default prompt template appends a bare `<think>\n` and relies on the model
+continuing from it. That works for the DeepSeek-R1 distills but **silently produces a
+degenerate dataset for chat models**: without the `<|im_start|>assistant` scaffolding,
+Qwen3-1.7B emits `</think>` as its first generated token, so every trajectory has
+thinking length N=1. This passes the `</think>` filter and reports a 100% success rate
+while containing no usable signal.
+
+Pass `--use_chat_template` for such models to format via the tokenizer's chat template
+with thinking enabled (Qwen3-1.7B: mean N goes from 1 to 2076).
+
+```bash
+python generate_tpv_data.py --model "Qwen/Qwen3-1.7B" --use_chat_template \
+  --max_new_tokens 4096 --dataset math500 --output_dir qwen3_hidden_states
+```
+
+## Evaluation Utilities
+
+```bash
+# R^2 on a prepared dataset (train_tpv.py reports MSE only)
+python eval_r2.py --input_dir <dataset_dir>
+
+# ...plus R^2 computed inside each held-out generation. Needs the raw hidden-states
+# dir because the .pkl files drop generation boundaries. Pooled R^2 can flatter a
+# probe that only knows roughly how far into an average trace a state sits.
+python eval_r2.py --input_dir <dataset_dir> --run_dir <hidden_states> --per_generation
+
+# R^2 by probe depth; streams H^T H / H^T y so no hidden states are materialised
+python layer_sweep.py --run_dir <hidden_states> --model <name>
+```
+
+`train_tpv.py` reports MSE only. Note it refits on train+test before saving weights, so
+the saved model is not the one whose held-out MSE is printed.
+
+A note on generation budget: `max_new_tokens` controls how many trajectories reach
+`</think>`, and `prepare_tpv_dataset.py` silently discards those that do not. At 1024
+tokens only 18.7% of Llama-8B generations survive (biasing the dataset toward short
+reasoning); at 4096 tokens 72.3% survive. Check the surviving fraction before trusting
+a result.
 
 ## Notes
 - Ensure that the model names and data paths are correctly set according to your environment.

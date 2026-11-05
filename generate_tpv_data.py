@@ -2,7 +2,7 @@
 # Commercial use requires a separate license.
 
 from transformers import AutoTokenizer, AutoModelForCausalLM
-from utils import load_problems 
+from utils import load_problems, resolve_hidden_layer, build_prompt_template
 import torch
 import numpy as np
 import os
@@ -31,6 +31,7 @@ def extract_llm_hidden_states(
     do_sample=True,
     top_p=0.95,
     seed=42,
+    hidden_layer=None,
 ):
     """
     Generate responses and extract hidden states from language models, 
@@ -64,7 +65,8 @@ def extract_llm_hidden_states(
             "temperature": temperature,
             "do_sample": do_sample,
             "top_p": top_p,
-            "seed": seed
+            "seed": seed,
+            "hidden_layer": hidden_layer
         },
         "problems": {}
     }
@@ -109,6 +111,16 @@ def extract_llm_hidden_states(
         # As a last resort, try to get it from a layer if possible, or error out.
         # For now, we'll assume it will be available via outputs.hidden_states[0][-1].shape[-1] later.
 
+
+    layer_idx = resolve_hidden_layer(model, hidden_layer)
+    print(f"[INFO] Extracting hidden_states[{layer_idx}] "
+          f"(model has {model.config.num_hidden_layers} decoder layers).")
+    if layer_idx != model.config.num_hidden_layers:
+        print("[NOTE] Using an intermediate layer. This measures better for MONITORING "
+              "but is NOT valid for tpv_intervention.py: intervening below the final "
+              "layer writes the edit into the KV cache instead of isolating it to one "
+              "decoding step. For the intervention pipeline re-run with --hidden_layer -1.")
+    results["config"]["resolved_hidden_layer"] = layer_idx
 
     # Optimized generation with hidden state extraction for a batch of sequences
     def generate_batch_with_last_hidden_states(
@@ -158,7 +170,7 @@ def extract_llm_hidden_states(
         # Hidden state extraction for INPUT (prompt)
         # outputs.hidden_states[0][-1] is the last layer's activations after processing the input prompt.
         # Shape: (num_return_sequences, input_sequence_length, hidden_size)
-        prompt_last_layer_hs_batch = outputs.hidden_states[0][-1]
+        prompt_last_layer_hs_batch = outputs.hidden_states[0][layer_idx]
         last_layer_hidden_states_input_list = [
             prompt_last_layer_hs_batch[k].detach().cpu().numpy() for k in range(num_return_sequences)
         ]
@@ -170,7 +182,7 @@ def extract_llm_hidden_states(
         # Try to get hidden_size from model.config, otherwise infer from tensor
         model_hidden_size = getattr(model.config, 'hidden_size', None)
         if model_hidden_size is None and outputs.hidden_states and outputs.hidden_states[0]:
-             model_hidden_size = outputs.hidden_states[0][-1].shape[-1]
+             model_hidden_size = outputs.hidden_states[0][layer_idx].shape[-1]
         if model_hidden_size is None:
             raise ValueError("Could not determine model hidden size for empty hidden state arrays.")
 
@@ -206,7 +218,7 @@ def extract_llm_hidden_states(
             
             for step_offset in range(min(actual_gen_len_k, num_hs_steps_available_for_gen_tokens)):
                 # step_offset 0 is the 1st generated token, HS index in outputs.hidden_states is step_offset + 1
-                hs_tensor_for_step = outputs.hidden_states[step_offset][-1] # Last layer, shape (batch_size, 1, hidden_dim)
+                hs_tensor_for_step = outputs.hidden_states[step_offset][layer_idx] # shape (batch_size, 1, hidden_dim)
                 token_hs = hs_tensor_for_step[k, -1, :].detach().cpu().numpy() # Get for sequence k, squeeze the token dim
                 gen_k_output_hs_for_actual_tokens.append(token_hs)
             
@@ -404,9 +416,25 @@ if __name__ == "__main__":
                         help="Top-p value for nucleus sampling")
     parser.add_argument("--seed", type=int, default=42,
                         help="Random seed for reproducibility. Set to a non-negative integer.")
+    parser.add_argument("--hidden_layer", type=int, default=None,
+                        help="Index into outputs.hidden_states to use as the TPV feature. "
+                             "Negative counts from the end (-1 = final layer, the old behaviour). "
+                             "Default: 45%% of depth, which measures substantially better than "
+                             "the final layer (see resolve_hidden_layer in utils.py).")
+    parser.add_argument("--use_chat_template", action="store_true", default=False,
+                        help="Format the problem with the tokenizer chat template and thinking "
+                             "enabled. Required for chat models such as Qwen3, which otherwise "
+                             "emit </think> immediately and yield zero-length thinking.")
     
     args = parser.parse_args()
-    
+
+    prompt_template = args.prompt_template
+    if args.use_chat_template:
+        from transformers import AutoTokenizer
+        prompt_template = build_prompt_template(
+            AutoTokenizer.from_pretrained(args.model), use_chat_template=True)
+        print(f"[INFO] Using chat template:\n{prompt_template}")
+
     current_seed = args.seed
 
     results_summary = extract_llm_hidden_states(
@@ -417,11 +445,12 @@ if __name__ == "__main__":
         end_problem_index=args.end_problem_index,
         generations_per_problem=args.generations_per_problem,
         output_dir=args.output_dir,
-        prompt_template=args.prompt_template,
+        prompt_template=prompt_template,
         temperature=args.temperature,
         do_sample=args.do_sample,
         top_p=args.top_p,
-        seed=current_seed
+        seed=current_seed,
+        hidden_layer=args.hidden_layer
     )
     # print("\nFinal results structure:")
     # print(json.dumps(results_summary, indent=2))
