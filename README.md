@@ -175,9 +175,16 @@ python generate_tpv_data.py --model "Qwen/Qwen3-1.7B" --use_chat_template \
 ## Evaluation Utilities
 
 ```bash
-python eval_r2.py --input_dir <dataset_dir>            # R^2; fp32/fp64 + intercept checks
-python eval_r2_per_gen.py --input_dir <hidden_states>  # within-generation R^2
-python layer_sweep.py --run_dir <hidden_states> --model <name>   # R^2 vs depth
+# R^2 on a prepared dataset (train_tpv.py reports MSE only)
+python eval_r2.py --input_dir <dataset_dir>
+
+# ...plus R^2 computed inside each held-out generation. Needs the raw hidden-states
+# dir because the .pkl files drop generation boundaries. Pooled R^2 can flatter a
+# probe that only knows roughly how far into an average trace a state sits.
+python eval_r2.py --input_dir <dataset_dir> --run_dir <hidden_states> --per_generation
+
+# R^2 by probe depth; streams H^T H / H^T y so no hidden states are materialised
+python layer_sweep.py --run_dir <hidden_states> --model <name>
 ```
 
 `train_tpv.py` reports MSE only. Note it refits on train+test before saving weights, so
